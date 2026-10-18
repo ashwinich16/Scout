@@ -49,10 +49,25 @@ const ECHO_TAIL_MS = 1200;
 export const END_OF_SENTENCE_MS = 1600;
 export const END_OF_SENTENCE_SLOW_MS = 2500;
 
+// Phones run speech recognition differently from laptops (laptops are unchanged):
+// - Android stops after every phrase and repeats words when asked to keep listening ("I I want I want to..."),
+//   so there Scout listens one phrase at a time.
+// - iPhone keeps listening but often never marks words final, so Scout also sends after a pause in unfinished
+//   words.
+// On both, phrases are joined into one sentence by the pause timer, and the microphone shows as listening
+// through the quick restarts instead of flickering on and off.
+const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+const ON_ANDROID = /Android/i.test(userAgent);
+export const ON_PHONE = ON_ANDROID || /iPhone|iPad|iPod/i.test(userAgent)
+  || (typeof navigator !== "undefined" && navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1); // iPad
+const PHONE_RETRY_MS = 400; // a phone refused to restart the microphone: try again after this
+
 // Listening: the browser's speech recognition, kept open for the whole conversation
 // (no start-up delay between turns). It restarts itself if the browser closes it.
 // `language` is the shopper's accent/language, e.g. "en-IN", "hi-IN".
-export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInterim, onFinal }) {
+// `hold` (used on phones): while true the microphone rests and is not restarted, e.g. while Scout thinks
+// and speaks, so Android does not beep every few seconds; it comes back as soon as `hold` ends.
+export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, hold = false, onInterim, onFinal }) {
   const Recognition =
     typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
   const [active, setActive] = useState(false); // the shopper wants Scout to listen
@@ -70,6 +85,9 @@ export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInter
   languageRef.current = language;
   const pauseRef = useRef(pauseMs);
   pauseRef.current = pauseMs;
+  const holdRef = useRef(hold);
+  holdRef.current = hold;
+  const unfinishedRef = useRef(""); // phones: words heard but not yet marked final
   const handlers = useRef({});
   handlers.current = { onInterim, onFinal };
 
@@ -81,15 +99,27 @@ export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInter
     if (text) handlers.current.onFinal?.(text, startedAt);
   };
 
+  // Phones: words the browser never marked final become part of the sentence.
+  const keepUnfinished = () => {
+    const words = unfinishedRef.current;
+    unfinishedRef.current = "";
+    if (!words) return;
+    const sentence = sentenceRef.current;
+    sentenceRef.current = { text: `${sentence.text} ${words}`.trim(),
+                            startedAt: sentence.startedAt ?? utteranceStartRef.current ?? Date.now() };
+  };
+
   launchRef.current = () => {
-    if (!Recognition || recognitionRef.current || !activeRef.current) return;
+    if (!Recognition || recognitionRef.current || !activeRef.current || holdRef.current) return;
     const recognition = new Recognition();
     recognition.lang = languageRef.current || "en-IN";
-    recognition.continuous = true;
+    recognition.continuous = !ON_ANDROID;
+    let closing = false; // phones: sent after a pause in unfinished words; ignore the rest of this session
     recognition.interimResults = true;
 
     recognition.onaudiostart = () => setHearing(true);
     recognition.onresult = (event) => {
+      if (closing) return;
       let interimText = "";
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
         const result = event.results[i];
@@ -103,12 +133,21 @@ export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInter
           interimText += `${text} `;
         }
       }
+      if (ON_PHONE) unfinishedRef.current = interimText.trim();
       const heardSoFar = `${sentenceRef.current.text} ${interimText}`.trim();
       setInterim(heardSoFar);
       clearTimeout(sentenceTimerRef.current);   // still talking: wait for the pause at the end
       if (interimText.trim()) {
         utteranceStartRef.current ??= Date.now();
         handlers.current.onInterim?.(heardSoFar, sentenceRef.current.startedAt ?? utteranceStartRef.current);
+        if (ON_PHONE) {
+          sentenceTimerRef.current = setTimeout(() => {   // quiet, but the words were never marked final
+            closing = true;
+            keepUnfinished();
+            finishSentence();
+            recognition.stop();                           // starts a fresh session, so nothing is repeated
+          }, pauseRef.current);
+        }
       } else if (sentenceRef.current.text) {
         sentenceTimerRef.current = setTimeout(finishSentence, pauseRef.current);
       }
@@ -121,10 +160,16 @@ export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInter
       }
     };
     recognition.onend = () => {
-      finishSentence();                          // the browser stopped listening: send what was heard
+      if (!ON_PHONE) finishSentence();           // the browser stopped listening: send what was heard
+      else if (activeRef.current && unfinishedRef.current) {   // phones: the pause timer sends the sentence
+        keepUnfinished();
+        clearTimeout(sentenceTimerRef.current);
+        sentenceTimerRef.current = setTimeout(finishSentence, pauseRef.current);
+      }
+      unfinishedRef.current = "";
       recognitionRef.current = null;
       utteranceStartRef.current = null;
-      setHearing(false);
+      if (!ON_PHONE || !activeRef.current || holdRef.current) setHearing(false); // phones: restarting, keep "listening"
       setInterim("");
       if (activeRef.current) setTimeout(() => launchRef.current?.(), 150); // keep the conversation open
     };
@@ -134,6 +179,7 @@ export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInter
       recognition.start();
     } catch {
       recognitionRef.current = null;
+      if (ON_PHONE) setTimeout(() => launchRef.current?.(), PHONE_RETRY_MS);
     }
   };
 
@@ -156,6 +202,12 @@ export function useSpeechInput({ language, pauseMs = END_OF_SENTENCE_MS, onInter
   useEffect(() => {
     recognitionRef.current?.stop();
   }, [language]);
+
+  // The microphone rests while `hold` is true and comes back when it ends.
+  useEffect(() => {
+    if (hold) recognitionRef.current?.stop();
+    else launchRef.current?.();
+  }, [hold]);
 
   useEffect(() => stop, [stop]);
   return { supported: Boolean(Recognition), active, hearing, interim, blocked, start, stop };

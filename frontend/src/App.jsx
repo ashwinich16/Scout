@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, setCredentials } from "./api.js";
 import { earcons } from "./audio/earcons.js";
 import {
-  END_OF_SENTENCE_MS, END_OF_SENTENCE_SLOW_MS, stripCues, useSpeaker, useSpeechInput, words,
+  END_OF_SENTENCE_MS, END_OF_SENTENCE_SLOW_MS, ON_PHONE, stripCues, useSpeaker, useSpeechInput, words,
 } from "./hooks/useVoice.js";
 import SignIn from "./components/SignIn.jsx";
 import Header from "./components/Header.jsx";
@@ -235,6 +235,8 @@ export default function App() {
   const voiceInput = useSpeechInput({
     language: settings.language,
     pauseMs: settings.moreTime ? END_OF_SENTENCE_SLOW_MS : END_OF_SENTENCE_MS,
+    // Phones: the microphone rests while Scout thinks and speaks ("Stop speaking" brings it back at once).
+    hold: ON_PHONE && (busy || speaker.speaking),
     // Barge-in: the shopper starts talking over Scout, so Scout stops at once.
     onInterim: (text) => {
       if (speaker.speaking && isInterruption(text)) stopSpeaking();
